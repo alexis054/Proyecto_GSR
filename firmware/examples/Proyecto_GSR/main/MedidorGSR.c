@@ -27,48 +27,57 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
 #include "led.h"
 #include "neopixel_stripe.h"
 #include "ble_mcu.h"
 #include "timer_mcu.h"
+
 #include "iir_filter.h"
+
+#include <uart_mcu.h>
+#include <analog_io_mcu.h>
+#include <switch.h>
+
 /*==================[macros and definitions]=================================*/
 #define CONFIG_BLINK_PERIOD 500
 #define LED_BT	            LED_1
-#define BUFFER_SIZE         256
-#define SAMPLE_FREQ	        200
 #define T_SENIAL            4000 
 #define CHUNK               4 
+
+#define CONFIG_MEASURE_PERIOD 2000
+#define BAUD_RATE 115200
+#define GSR_TRESHOLD 350
 /*==================[internal data definition]===============================*/
-float ecg[] = {
-     76,  76,  77,  77,  76,  83,  85,  78,  76,  85,  93,  85,  79,
-     86,  93,  93,  85,  87,  94,  98,  93,  87,  95, 104,  99,  91,
-     93, 102, 104,  99,  96, 101, 106, 102,  96,  97, 104, 106,  97,
-     94, 100, 103, 101,  91,  95, 103, 100,  94,  90,  98, 104,  94,
-     87,  93,  99,  97,  87,  86,  96,  98,  90,  83,  90,  96,  89,
-     81,  80,  87,  92,  82,  78,  84,  89,  80,  72,  78,  82,  82,
-     73,  72,  81,  82,  79,  69,  77,  82,  81,  76,  68,  78,  80,
-     76,  73,  78,  82,  82,  75,  72,  86,  84,  78,  76,  85,  95,
-     88,  81,  83,  93,  90,  86,  83,  88,  93,  86,  82,  82,  92,
-     89,  82,  82,  88,  94,  84,  82,  90,  98,  94,  87,  91,  95,
-     98,  93,  90,  97, 104, 105,  96,  93, 107, 116, 118, 127, 148,
-    181, 208, 231, 252, 241, 198, 139,  76,  43,  32,  29,  42,  65,
-     86,  90,  88,  93, 101, 107, 102,  98, 103, 110, 104,  98,  99,
-    107, 109,  96,  95, 103, 107, 102,  95,  95, 102, 105,  94,  94,
-    102, 102,  99,  94,  96, 102,  99,  90,  92, 100, 102,  95,  90,
-     98, 104,  97,  89,  94, 102, 103,  97,  93, 100, 105, 102,  93,
-     97, 104, 104, 100,  96, 108, 111, 104,  99, 101, 108, 102,  96,
-     97, 104, 104,  97,  89,  91, 100,  91,  81,  79,  85,  86,  73,
-     69,  75,  79,  75,  68,  68,  76,  76,  69,  67,  74,  81,  77,
-     71,  72,  82,  82,  76,  77,  76,  76,  75
-};
-static float ecg_filt[CHUNK];
+
+TaskHandle_t covert_digital_task_handle = NULL;
+TaskHandle_t turnon_LEDs_GSR_task_handle = NULL;
 TaskHandle_t fft_task_handle = NULL;
+
+uint16_t reading = 0;
+bool measure_reading = false;
 bool filter = false;
+
 /*==================[internal functions declaration]=========================*/
-void read_data(uint8_t * data, uint8_t length){
+
+void FuncTimerA(void* param){
+
+    vTaskNotifyGiveFromISR(covert_digital_task_handle, pdFALSE);
+	vTaskNotifyGiveFromISR(turnon_LEDs_GSR_task_handle, pdFALSE); 
+
+}
+
+
+
+void FuncTimerSenial(void* param){
+    xTaskNotifyGive(fft_task_handle);
+}
+
+void read_data(uint8_t * data, uint8_t length)
+{
     switch(data[0]){
         case 'A':
             filter = true;
@@ -78,12 +87,8 @@ void read_data(uint8_t * data, uint8_t length){
             break;
     }
 }
-
-void FuncTimerSenial(void* param){
-    xTaskNotifyGive(fft_task_handle);
-}
-
-static void FftTask(void *pvParameter){
+static void FftTask(void *pvParameter)
+{
     char msg[128];
     char msg_chunk[24];
     static uint8_t indice = 0;
@@ -105,6 +110,33 @@ static void FftTask(void *pvParameter){
         BleSendString(msg);
     }
 }
+
+static void turnon_LEDs_GSR(void *pvParameter)
+{ 
+	while(true)
+	{	
+		if (measure_reading)
+			{
+				if(reading < GSR_TRESHOLD)
+				{	
+                    LedOn(LED_1);
+                }
+				else {
+						LedToggle(LED_2);
+						LedOff(LED_1);
+					 }
+					
+			}
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+	}	
+}
+
+void static read_switches(void *pvParameter)
+{
+    bool *flags = (bool*) pvParameter;
+	*flags = !*flags;
+}
+
 /*==================[external functions definition]==========================*/
 void app_main(void){
     uint8_t blink = 0;
@@ -124,32 +156,51 @@ void app_main(void){
     NeoPixelAllOff();
     TimerInit(&timer_senial);
     LedsInit();  
-    LowPassInit(SAMPLE_FREQ, 30, ORDER_2);
-    HiPassInit(SAMPLE_FREQ, 1, ORDER_2);
+    LowPassInit(CONFIG_MEASURE_PERIOD, 30, ORDER_2);
+    HiPassInit(CONFIG_MEASURE_PERIOD, 1, ORDER_2);
     BleInit(&ble_configuration);
 
     xTaskCreate(&FftTask, "FFT", 4096, NULL, 5, &fft_task_handle);
     TimerStart(timer_senial.timer);
 
-    while(1){
-        vTaskDelay(CONFIG_BLINK_PERIOD / portTICK_PERIOD_MS);
-        switch(BleStatus()){
-            case BLE_OFF:
-                NeoPixelAllOff();
-            break;
-            case BLE_DISCONNECTED:
-                if(blink%2){
-                    NeoPixelAllColor(NEOPIXEL_COLOR_BLUE);
-                }else{
-                    NeoPixelAllOff();
-                }
-                blink++;
-            break;
-            case BLE_CONNECTED:
-                NeoPixelAllColor(NEOPIXEL_COLOR_BLUE);
-            break;
-        }
-    }
+ 
+    
+    analog_input_config_t analog_input ={
+		.input = CH1,
+		.mode = ADC_SINGLE,
+	};
+	
+	AnalogInputInit(&analog_input);
+	AnalogOutputInit();
+
+	serial_config_t serial_pc ={
+		.port = UART_PC,
+		.baud_rate = BAUD_RATE,
+		.func_p = NULL,
+		.param_p = NULL,
+	};
+
+	UartInit(&serial_pc);
+
+	timer_config_t timer_measurement = {
+    	.timer = TIMER_A,
+        .period = CONFIG_MEASURE_PERIOD,
+        .func_p = FuncTimerA,
+        .param_p = NULL
+    };
+
+	LedsInit();
+	SwitchesInit();
+
+	SwitchActivInt(SWITCH_1, read_switches, &measure_reading);
+	SwitchActivInt(SWITCH_2, LedsOffAll, NULL);
+
+	TimerInit(&timer_measurement);
+
+	xTaskCreate(&convert_digital, "Convertir señal a Digital", 1024, NULL, 5, &covert_digital_task_handle);
+	xTaskCreate(&turnon_LEDs_GSR, "Prender los LEDs segun los eventos", 1024, NULL, 5, &turnon_LEDs_GSR_task_handle);
+
+	TimerStart(timer_measurement.timer);
 }
 
 /*==================[end of file]============================================*/
